@@ -1,61 +1,36 @@
 /**
- * Polymarket CLOB MCP Server
- * REST wrapper for https://clob.polymarket.com
- * Public endpoints (L0) + Authenticated endpoints (L2 via HMAC-SHA256)
+ * Polymarket Analysis MCP Server
+ * Hybrid: Gamma API (rich market data) + CLOB API (orderbook depth)
+ * Fully public — no authentication required
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import http from "http";
-import { createHmac } from "crypto";
 import { URL } from "url";
 
-const CLOB_BASE = "https://clob.polymarket.com";
-const API_KEY    = process.env.POLY_API_KEY    || "";
-const API_SECRET = process.env.POLY_API_SECRET || "";
-const API_PASS   = process.env.POLY_API_PASS   || "";
+const GAMMA  = "https://gamma-api.polymarket.com";
+const CLOB   = "https://clob.polymarket.com";
 
-function buildL2Headers(method: string, path: string, body = ""): Record<string, string> {
-  const ts = Math.floor(Date.now() / 1000).toString();
-  const message = ts + method.toUpperCase() + path + body;
-  const sig = createHmac("sha256", Buffer.from(API_SECRET, "base64"))
-    .update(message).digest("base64");
-  return {
-    "Content-Type": "application/json",
-    "POLY-API-KEY": API_KEY,
-    "POLY-TIMESTAMP": ts,
-    "POLY-SIGNATURE": sig,
-    "POLY-PASSPHRASE": API_PASS,
-  };
-}
-
-async function clobGet(path: string, params: Record<string, string | number | undefined> = {}, auth = false) {
-  const url = new URL(`${CLOB_BASE}${path}`);
+// ── Generic fetch helpers ────────────────────────────────────
+async function get(base: string, path: string, params: Record<string, string | number | boolean | undefined> = {}) {
+  const url = new URL(`${base}${path}`);
   for (const [k, v] of Object.entries(params)) {
     if (v !== undefined) url.searchParams.set(k, String(v));
   }
-  const headers: Record<string, string> = auth
-    ? buildL2Headers("GET", path + (url.search || ""))
-    : { "Content-Type": "application/json" };
-  const res = await fetch(url.toString(), { headers });
-  if (!res.ok) throw new Error(`CLOB ${res.status}: ${await res.text()}`);
+  const res = await fetch(url.toString(), { headers: { "Content-Type": "application/json" } });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}: ${await res.text()}`);
   return res.json();
 }
 
-async function clobPost(path: string, body: unknown, auth = true) {
-  const raw = JSON.stringify(body);
-  const headers = auth ? buildL2Headers("POST", path, raw) : { "Content-Type": "application/json" };
-  const res = await fetch(`${CLOB_BASE}${path}`, { method: "POST", headers, body: raw });
-  if (!res.ok) throw new Error(`CLOB POST ${res.status}: ${await res.text()}`);
-  return res.json();
-}
-
-async function clobDelete(path: string, body?: unknown, auth = true) {
-  const raw = body ? JSON.stringify(body) : "";
-  const headers = auth ? buildL2Headers("DELETE", path, raw) : { "Content-Type": "application/json" };
-  const res = await fetch(`${CLOB_BASE}${path}`, { method: "DELETE", headers, ...(raw ? { body: raw } : {}) });
-  if (!res.ok) throw new Error(`CLOB DELETE ${res.status}: ${await res.text()}`);
+async function post(base: string, path: string, body: unknown) {
+  const res = await fetch(`${base}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}: ${await res.text()}`);
   return res.json();
 }
 
@@ -63,194 +38,267 @@ function ok(data: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
 }
 
-function hasL2() { return !!(API_KEY && API_SECRET && API_PASS); }
-
-function requireL2() {
-  if (!hasL2()) return { content: [{ type: "text" as const, text: JSON.stringify({
-    error: "L2 auth required. Set POLY_API_KEY, POLY_API_SECRET, POLY_API_PASS env vars."
-  }) }] };
-  return null;
-}
-
+// ── MCP server ───────────────────────────────────────────────
 const server = new McpServer({
-  name: "polymarket-clob",
-  version: "1.0.0",
-  description: "Polymarket CLOB API — order book, trading, positions (clob.polymarket.com)"
+  name: "polymarket-analysis",
+  version: "2.0.0",
+  description: "Polymarket full market data — Gamma API + CLOB orderbook depth, no auth required",
 });
 
-// ── PUBLIC (L0) ──
-server.tool("polymarket_status", "CLOB API health check", {}, async () => ok(await clobGet("/")));
-server.tool("polymarket_server_time", "CLOB server timestamp", {}, async () => ok(await clobGet("/time")));
+// ════════════════════════════════════════════════════════════
+// GAMMA — Market discovery & analytics
+// ════════════════════════════════════════════════════════════
 
-server.tool("polymarket_get_markets", "List CLOB markets (paginated). Returns token IDs, tick sizes, accepting_orders.",
-  { next_cursor: z.string().optional().describe("Pagination cursor") },
-  async ({ next_cursor }) => ok(await clobGet("/markets", { next_cursor }))
+server.tool(
+  "poly_list_markets",
+  "List Polymarket markets with filters. Returns prices, volume, liquidity, bid/ask, price changes.",
+  {
+    active:      z.boolean().optional().default(true).describe("Only active markets"),
+    closed:      z.boolean().optional().default(false).describe("Include closed markets"),
+    limit:       z.number().int().min(1).max(100).optional().default(20),
+    offset:      z.number().int().optional().default(0),
+    order:       z.enum(["volume", "volume24hr", "liquidity", "createdAt", "endDate"]).optional().default("volume"),
+    ascending:   z.boolean().optional().default(false),
+    tag:         z.string().optional().describe("Filter by tag/category (e.g. 'crypto', 'politics', 'sports')"),
+    liquidity_min: z.number().optional().describe("Minimum liquidity in USD"),
+  },
+  async ({ active, closed, limit, offset, order, ascending, tag, liquidity_min }) =>
+    ok(await get(GAMMA, "/markets", {
+      active, closed, limit, offset,
+      order, ascending,
+      tag_slug: tag,
+      liquidity_num_min: liquidity_min,
+    }))
 );
 
-server.tool("polymarket_get_market", "Get CLOB market by condition ID",
-  { condition_id: z.string().describe("Market condition ID (hex)") },
-  async ({ condition_id }) => ok(await clobGet(`/markets/${condition_id}`))
+server.tool(
+  "poly_search_markets",
+  "Full-text search across Polymarket markets by keyword.",
+  {
+    q:      z.string().describe("Search query (e.g. 'bitcoin', 'election', 'world cup')"),
+    active: z.boolean().optional().default(true),
+    limit:  z.number().int().min(1).max(50).optional().default(10),
+  },
+  async ({ q, active, limit }) =>
+    ok(await get(GAMMA, "/markets", { q, active, limit }))
 );
 
-server.tool("polymarket_get_orderbook", "Get live order book (bids/asks) for a token",
-  { token_id: z.string().describe("Token ID (YES or NO outcome)") },
-  async ({ token_id }) => ok(await clobGet("/book", { token_id }))
+server.tool(
+  "poly_get_market",
+  "Get a single market by slug or condition ID. Returns full analytics: prices, volume, liquidity, bid/ask, spread, price changes (1h/1d/1w/1m).",
+  {
+    slug:         z.string().optional().describe("Market slug (from URL, e.g. 'will-btc-hit-100k')"),
+    condition_id: z.string().optional().describe("Condition ID (hex 0x...)"),
+  },
+  async ({ slug, condition_id }) => {
+    if (!slug && !condition_id) throw new Error("Provide slug or condition_id");
+    const params: Record<string, string> = {};
+    if (slug)         params.slug         = slug;
+    if (condition_id) params.condition_id = condition_id;
+    return ok(await get(GAMMA, "/markets", params));
+  }
 );
 
-server.tool("polymarket_get_orderbooks", "Get order books for multiple tokens",
+server.tool(
+  "poly_list_events",
+  "List Polymarket events (groups of related markets). Good for finding all markets in a theme (e.g. 'World Cup 2026').",
+  {
+    active:  z.boolean().optional().default(true),
+    limit:   z.number().int().min(1).max(50).optional().default(10),
+    offset:  z.number().int().optional().default(0),
+    order:   z.enum(["volume", "liquidity", "createdAt", "endDate"]).optional().default("volume"),
+    tag:     z.string().optional().describe("Filter by tag"),
+  },
+  async ({ active, limit, offset, order, tag }) =>
+    ok(await get(GAMMA, "/events", { active, limit, offset, order, tag_slug: tag }))
+);
+
+server.tool(
+  "poly_get_event",
+  "Get a single event with all its markets by event slug.",
+  { slug: z.string().describe("Event slug") },
+  async ({ slug }) => ok(await get(GAMMA, "/events", { slug }))
+);
+
+server.tool(
+  "poly_top_movers",
+  "Markets with highest price change over a given period. Great for spotting trending bets.",
+  {
+    period:  z.enum(["1h", "1d", "1w", "1m"]).optional().default("1d").describe("Price change period"),
+    limit:   z.number().int().min(1).max(50).optional().default(10),
+    active:  z.boolean().optional().default(true),
+    min_liquidity: z.number().optional().default(1000).describe("Minimum liquidity USD to filter noise"),
+  },
+  async ({ period, limit, active, min_liquidity }) => {
+    const fieldMap: Record<string, string> = {
+      "1h": "oneHourPriceChange",
+      "1d": "oneDayPriceChange",
+      "1w": "oneWeekPriceChange",
+      "1m": "oneMonthPriceChange",
+    };
+    const data = await get(GAMMA, "/markets", {
+      active, limit: 200, liquidity_num_min: min_liquidity,
+      order: "volume", ascending: false,
+    }) as unknown[];
+    const arr = Array.isArray(data) ? data : (data as { data: unknown[] }).data ?? [];
+    const field = fieldMap[period];
+    const sorted = (arr as Record<string, unknown>[])
+      .filter(m => m[field] !== undefined && m[field] !== null)
+      .sort((a, b) => Math.abs(Number(b[field])) - Math.abs(Number(a[field])))
+      .slice(0, limit)
+      .map(m => ({
+        question: m.question,
+        slug: m.slug,
+        priceChange: m[field],
+        lastTradePrice: m.lastTradePrice,
+        bestBid: m.bestBid,
+        bestAsk: m.bestAsk,
+        liquidity: m.liquidity,
+        volume24hr: m.volume24hr,
+      }));
+    return ok({ period, movers: sorted });
+  }
+);
+
+server.tool(
+  "poly_market_snapshot",
+  "Full analytical snapshot of a market: prices, volume breakdown, bid/ask, spread, price changes across all periods.",
+  { slug: z.string().describe("Market slug") },
+  async ({ slug }) => {
+    const data = await get(GAMMA, "/markets", { slug }) as Record<string, unknown>[];
+    if (!data?.length) throw new Error(`Market not found: ${slug}`);
+    const m = data[0];
+    return ok({
+      question:            m.question,
+      category:            m.category,
+      endDate:             m.endDateIso,
+      active:              m.active,
+      closed:              m.closed,
+      // Pricing
+      lastTradePrice:      m.lastTradePrice,
+      bestBid:             m.bestBid,
+      bestAsk:             m.bestAsk,
+      spread:              m.spread,
+      outcomePrices:       m.outcomePrices,
+      // Volume
+      volume:              m.volume,
+      volume24hr:          m.volume24hr,
+      volume1wk:           m.volume1wk,
+      volume1mo:           m.volume1mo,
+      // Liquidity
+      liquidity:           m.liquidity,
+      competitive:         m.competitive,
+      // Price changes
+      priceChange1h:       m.oneHourPriceChange,
+      priceChange1d:       m.oneDayPriceChange,
+      priceChange1w:       m.oneWeekPriceChange,
+      priceChange1m:       m.oneMonthPriceChange,
+      priceChange1y:       m.oneYearPriceChange,
+      // CLOB info
+      clobTokenIds:        m.clobTokenIds,
+      conditionId:         m.conditionId,
+    });
+  }
+);
+
+// ════════════════════════════════════════════════════════════
+// CLOB — Orderbook depth & trade data (public, no auth)
+// ════════════════════════════════════════════════════════════
+
+server.tool(
+  "poly_orderbook",
+  "Get CLOB order book (bids/asks) for a token. Use clobTokenIds from poly_market_snapshot to get the token ID.",
+  { token_id: z.string().describe("CLOB token ID (from clobTokenIds field of a market)") },
+  async ({ token_id }) => {
+    const data = await get(CLOB, "/book", { token_id }) as Record<string, unknown>;
+    const bids = (data.bids as { price: string; size: string }[]) ?? [];
+    const asks = (data.asks as { price: string; size: string }[]) ?? [];
+    return ok({
+      token_id,
+      bids_count: bids.length,
+      asks_count: asks.length,
+      best_bid:   bids[0]  ?? null,
+      best_ask:   asks[0]  ?? null,
+      top5_bids:  bids.slice(0, 5),
+      top5_asks:  asks.slice(0, 5),
+      full_book:  data,
+    });
+  }
+);
+
+server.tool(
+  "poly_orderbooks_batch",
+  "Get CLOB order books for multiple tokens at once (max 20).",
   { token_ids: z.array(z.string()).min(1).max(20) },
-  async ({ token_ids }) => ok(await clobPost("/books", token_ids.map(id => ({ token_id: id })), false))
+  async ({ token_ids }) =>
+    ok(await post(CLOB, "/books", token_ids.map(id => ({ token_id: id }))))
 );
 
-server.tool("polymarket_get_price", "Get best bid or ask for a token",
-  { token_id: z.string(), side: z.enum(["BUY", "SELL"]).describe("BUY=best ask, SELL=best bid") },
-  async ({ token_id, side }) => ok(await clobGet("/price", { token_id, side }))
-);
-
-server.tool("polymarket_get_prices", "Get prices for multiple tokens",
-  { token_ids: z.array(z.string()).min(1), side: z.enum(["BUY", "SELL"]) },
-  async ({ token_ids, side }) => ok(await clobPost("/prices", token_ids.map(id => ({ token_id: id, side })), false))
-);
-
-server.tool("polymarket_get_midpoint", "Get midpoint price for a token",
+server.tool(
+  "poly_last_trade_price",
+  "Get last traded price for a CLOB token.",
   { token_id: z.string() },
-  async ({ token_id }) => ok(await clobGet("/midpoint", { token_id }))
+  async ({ token_id }) => ok(await get(CLOB, "/last-trade-price", { token_id }))
 );
 
-server.tool("polymarket_get_spread", "Get bid-ask spread for a token",
-  { token_id: z.string() },
-  async ({ token_id }) => ok(await clobGet("/spread", { token_id }))
-);
-
-server.tool("polymarket_get_last_trade_price", "Last trade price for a token",
-  { token_id: z.string() },
-  async ({ token_id }) => ok(await clobGet("/last-trade-price", { token_id }))
-);
-
-server.tool("polymarket_get_price_history", "Historical price timeseries for a token",
+server.tool(
+  "poly_price_history",
+  "Historical price timeseries for a CLOB token. Use token_id from clobTokenIds.",
   {
     token_id: z.string(),
-    interval: z.enum(["1m", "1h", "1d", "1w", "1mo", "max"]).optional().default("1d"),
-    startTs: z.number().optional().describe("Unix timestamp start"),
-    endTs: z.number().optional().describe("Unix timestamp end"),
+    interval: z.enum(["1m", "1h", "6h", "1d", "1w", "1mo", "max"]).optional().default("1d"),
+    start_ts: z.number().optional().describe("Unix timestamp start"),
+    end_ts:   z.number().optional().describe("Unix timestamp end"),
   },
-  async ({ token_id, interval, startTs, endTs }) =>
-    ok(await clobGet("/prices-history", { market: token_id, interval, startTs, endTs }))
+  async ({ token_id, interval, start_ts, end_ts }) =>
+    ok(await get(CLOB, "/prices-history", {
+      market: token_id, interval,
+      startTs: start_ts, endTs: end_ts,
+    }))
 );
 
-// ── AUTHENTICATED (L2) ──
-server.tool("polymarket_get_open_orders", "Your open orders. L2 required.",
-  { market: z.string().optional(), token_id: z.string().optional() },
-  async ({ market, token_id }) => {
-    const err = requireL2(); if (err) return err;
-    const p: Record<string, string | undefined> = {};
-    if (market)   p.market   = market;
-    if (token_id) p.asset_id = token_id;
-    return ok(await clobGet("/data/orders", p, true));
-  }
+server.tool(
+  "poly_clob_markets",
+  "List CLOB markets (paginated). Useful for finding markets with active order books.",
+  {
+    next_cursor: z.string().optional().describe("Pagination cursor from previous call"),
+    limit:       z.number().int().optional().default(20),
+  },
+  async ({ next_cursor, limit }) =>
+    ok(await get(CLOB, "/markets", { next_cursor, limit }))
 );
 
-server.tool("polymarket_get_order", "Get order by hash. L2 required.",
-  { order_id: z.string().describe("Order hash 0x...") },
-  async ({ order_id }) => {
-    const err = requireL2(); if (err) return err;
-    return ok(await clobGet(`/data/order/${order_id}`, {}, true));
-  }
+server.tool(
+  "poly_clob_market",
+  "Get a single CLOB market by condition ID.",
+  { condition_id: z.string().describe("Condition ID (hex 0x...)") },
+  async ({ condition_id }) => ok(await get(CLOB, `/markets/${condition_id}`))
 );
 
-server.tool("polymarket_get_trades", "Your trade history. L2 required.",
-  { market: z.string().optional(), token_id: z.string().optional(), limit: z.number().int().optional().default(50) },
-  async ({ market, token_id, limit }) => {
-    const err = requireL2(); if (err) return err;
-    return ok(await clobGet("/data/trades", { market, asset_id: token_id, limit }, true));
-  }
-);
-
-server.tool("polymarket_post_order",
-  "Place a signed limit order. L2 required. Order must be pre-signed via py-clob-client or @polymarket/clob-client.",
-  { order: z.object({}).passthrough(), orderType: z.enum(["GTC", "GTD", "FOK", "FAK"]).default("GTC") },
-  async ({ order, orderType }) => {
-    const err = requireL2(); if (err) return err;
-    return ok(await clobPost("/order", { order, orderType }));
-  }
-);
-
-server.tool("polymarket_post_orders_batch", "Place up to 15 orders at once. L2 required.",
-  { orders: z.array(z.object({ order: z.object({}).passthrough(), orderType: z.enum(["GTC","GTD","FOK","FAK"]).default("GTC") })).min(1).max(15) },
-  async ({ orders }) => {
-    const err = requireL2(); if (err) return err;
-    return ok(await clobPost("/orders", orders));
-  }
-);
-
-server.tool("polymarket_cancel_order", "Cancel one order. L2 required.",
-  { order_id: z.string() },
-  async ({ order_id }) => {
-    const err = requireL2(); if (err) return err;
-    return ok(await clobDelete(`/order/${order_id}`));
-  }
-);
-
-server.tool("polymarket_cancel_orders", "Cancel multiple orders. L2 required.",
-  { order_ids: z.array(z.string()).min(1) },
-  async ({ order_ids }) => {
-    const err = requireL2(); if (err) return err;
-    return ok(await clobDelete("/orders", order_ids));
-  }
-);
-
-server.tool("polymarket_cancel_market_orders", "Cancel all orders for a market. L2 required.",
-  { market: z.string(), asset_id: z.string().optional() },
-  async ({ market, asset_id }) => {
-    const err = requireL2(); if (err) return err;
-    const body: Record<string, string> = { market };
-    if (asset_id) body.asset_id = asset_id;
-    return ok(await clobDelete("/cancel-market-orders", body));
-  }
-);
-
-server.tool("polymarket_cancel_all", "Cancel ALL open orders. L2 required. WARNING: kills every position.",
-  {},
-  async () => {
-    const err = requireL2(); if (err) return err;
-    return ok(await clobDelete("/cancel-all"));
-  }
-);
-
-server.tool("polymarket_derive_api_key",
-  "How to generate CLOB L2 API credentials from your wallet (one-time setup)",
-  {},
-  async () => ok({
-    info: "Run once to derive your API key:",
-    python: [
-      "pip install py-clob-client",
-      "from py_clob_client.client import ClobClient",
-      "client = ClobClient('https://clob.polymarket.com', key='<PRIVATE_KEY>', chain_id=137, signature_type=1, funder='<FUNDER_ADDRESS>')",
-      "creds = client.create_or_derive_api_creds()",
-      "print(creds)"
-    ],
-    env_vars: {
-      POLY_API_KEY: "creds.api_key",
-      POLY_API_SECRET: "creds.api_secret",
-      POLY_API_PASS: "creds.api_passphrase"
-    },
-    funder_address: "0xee1a210374bf03b03364d5dcca00190994ba6529"
-  })
-);
-
-// ── HTTP server ──
+// ════════════════════════════════════════════════════════════
+// HTTP server
+// ════════════════════════════════════════════════════════════
 const PORT = parseInt(process.env.PORT || "3000");
 const httpServer = http.createServer(async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept");
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+
   const url = new URL(req.url!, `http://localhost:${PORT}`);
+
   if (url.pathname === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", server: "polymarket-clob-mcp", l2_auth: hasL2() ? "configured" : "read-only" }));
+    res.end(JSON.stringify({
+      status: "ok",
+      server: "polymarket-analysis-mcp",
+      version: "2.0.0",
+      sources: ["gamma-api.polymarket.com", "clob.polymarket.com"],
+      auth: "none",
+    }));
     return;
   }
+
   if (url.pathname === "/mcp") {
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => transport.close());
@@ -262,16 +310,21 @@ const httpServer = http.createServer(async (req, res) => {
     }
     return;
   }
-  res.writeHead(404); res.end(JSON.stringify({ error: "Use /mcp or /health" }));
+
+  res.writeHead(404);
+  res.end(JSON.stringify({ error: "Use /mcp or /health" }));
 });
+
 function readBody(req: http.IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    const c: Buffer[] = [];
-    req.on("data", x => c.push(x));
-    req.on("end", () => resolve(Buffer.concat(c)));
+    const chunks: Buffer[] = [];
+    req.on("data", c => chunks.push(c));
+    req.on("end", () => resolve(Buffer.concat(chunks)));
     req.on("error", reject);
   });
 }
+
 httpServer.listen(PORT, "0.0.0.0", () => {
-  console.log(`Polymarket CLOB MCP on :${PORT} | L2: ${hasL2() ? "OK" : "read-only"}`);
+  console.log(`Polymarket Analysis MCP v2.0 on :${PORT}`);
+  console.log(`Sources: Gamma API + CLOB API (no auth)`);
 });
