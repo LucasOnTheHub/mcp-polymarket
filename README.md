@@ -1,0 +1,1 @@
+# polymarket-clob-mcp\nMCP server for Polymarket CLOB API\n
